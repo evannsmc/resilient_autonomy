@@ -7,10 +7,11 @@ from px4_msgs.msg import(
     OffboardControlMode, VehicleCommand, #Import basic PX4 ROS2-API messages for switching to offboard mode
     TrajectorySetpoint, VehicleRatesSetpoint, # Msgs for sending setpoints to the vehicle in various offboard modes
     VehicleStatus, #Import PX4 ROS2-API messages for receiving vehicle state information
+    ActuatorInhibit,
     RcChannels,
-    FullState,
-    ActuatorInhibit
 )
+from mocap_msgs.msg import FullState
+
 
 
 import inspect
@@ -107,7 +108,7 @@ class OffboardControl(Node):
         self.vehicle_odometry_subscriber = self.create_subscription(
             FullState, '/merge_odom_localpos/full_state_relay', self.vehicle_odometry_subscriber_callback, qos_profile)
         self.vehicle_status_subscriber = self.create_subscription(
-            VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_subscriber_callback, qos_profile)
+            VehicleStatus, '/fmu/out/vehicle_status_v1', self.vehicle_status_subscriber_callback, qos_profile)
             
         self.offboard_mode_rc_switch_on: bool = True if self.sim else False   # RC switch related variables and subscriber
         print(f"RC switch mode: {'On' if self.offboard_mode_rc_switch_on else 'Off'}")
@@ -176,7 +177,7 @@ class OffboardControl(Node):
 
     def vehicle_odometry_subscriber_callback(self, msg) -> None:
         """Callback function for vehicle odometry topic subscriber."""
-        print(f"{BANNER}Received odometry data: {msg=}")
+        # print(f"{BANNER}Received odometry data: {msg=}")
 
         self.x = msg.position[0]
         self.y = msg.position[1]
@@ -212,7 +213,7 @@ class OffboardControl(Node):
         print(f"in odom, flat output: {self.output_vector}")
 
 
-        ODOMETRY_DEBUG_PRINT = True
+        ODOMETRY_DEBUG_PRINT = False
         if ODOMETRY_DEBUG_PRINT:
             print(f"{self.nr_state_vector=}")
             print(f"{self.output_vector=}")
@@ -259,9 +260,8 @@ class OffboardControl(Node):
         if t < self.begin_actuator_control:
             publish_position_setpoint(self, 0., self.max_y, self.max_height, 0.0)
         elif t < self.land_time:
-            if self.inhibit_on:
-                self.motor_inhibition_administrator()
             self.control_administrator()
+            self.motor_inhibition_administrator()
 
         elif t > self.land_time or (abs(self.z) <= 1.0 and t > 15):
             print("Landing...")
@@ -276,21 +276,43 @@ class OffboardControl(Node):
         
     def motor_inhibition_administrator(self) -> None:
         """Send actuator_inhibit messages."""
+        t = self.time_from_start
+        
+        if not self.inhibit_on:
+            return  # Already sent inhibit command
+        
+        if t < self.begin_actuator_control + 10:
+            return  # Wait until 10 seconds after starting actuator control
+
         print(f"{BANNER}In motor_inhibition_administrator.")
+        msg = ActuatorInhibit()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
 
-        actuator_inhibit_msg = ActuatorInhibit()
-        actuator_inhibit_msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-        mask = [1, 0, 0, 0] + 8 * [0]
-        actuator_inhibit_msg.inhibit_mask = mask
-        actuator_inhibit_msg.horizon_s = [0., 0., 0., 0.] + 8 * [0.]
-        period = 0.25
-        freq = 1.0 / period
-        actuator_inhibit_msg.toggle_hz = [freq, 0., 0., 0.] + 8 * [0.]
+        # Build full 12-length arrays
+        mask       = [0]*12
+        horizon_s  = [0.0]*12
+        toggle_hz  = [0.0]*12
 
+        # Example A: Motor 0 steady OFF for 3s
+        # mask[0] = 1
+        # horizon_s[0] = 3.0
+        # toggle_hz[0] = 0.0            # 0 => no pulsing, steady OFF
 
-        self.actuator_inhibit_publisher.publish(actuator_inhibit_msg)
+        # Example B: Motors 0-(motors-1) pulse at 5 Hz for 1s (hard 0/1)
+        motors = 1
+        for i in range(motors):
+            mask[i] = 1
+            horizon_s[i] = 2.0
+            toggle_hz[i] = 100.0       # clamped to <= 240 by C++
 
-        self.inhibit_on = False
+        msg.inhibit_mask = mask
+        msg.horizon_s    = horizon_s
+        msg.toggle_hz    = toggle_hz
+
+        # Publish ONCE to start the schedule
+        self.actuator_inhibit_publisher.publish(msg)
+
+        self.inhibit_on = False  # Send inhibit only once
 
 
     def control_administrator(self) -> None:
@@ -318,8 +340,8 @@ class OffboardControl(Node):
 
     def get_ref(self) -> None:
         """Get reference values for control."""
-        self.x_ref = 1.0
-        self.y_ref = 2.0
+        self.x_ref = 0.0
+        self.y_ref = 0.0
         self.z_ref = -5.0
         self.yaw_ref = 0.0
 

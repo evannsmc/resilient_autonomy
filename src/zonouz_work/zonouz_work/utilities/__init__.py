@@ -3,7 +3,7 @@ from .utilities import (
     adjust_yaw
 )
 
-from .jax_setup import jit
+# from .jax_setup import jit
 
 from . import sim_utilities
 from . import hardware_utilities
